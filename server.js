@@ -46,7 +46,7 @@ app.get('/', (req, res) => res.type('html').send(LANDING));
 app.get('/health', (req, res) => res.json({
   ok: true,
   ffmpeg: Boolean(ffmpegPath),
-  evaluate: { groq: Boolean(GROQ_KEY), deepgram: Boolean(DG_KEY) },
+  evaluate: { groq: Boolean(GROQ_KEY), deepgram: Boolean(DG_KEY), order: String(process.env.EVAL_PROVIDER_ORDER || 'groq,deepgram') },
   apps: { en: fs.existsSync(path.join(__dirname, 'en.html')), ko: fs.existsSync(path.join(__dirname, 'ko.html')) }
 }));
 
@@ -76,6 +76,7 @@ app.get('/ko', sendApp('ko.html'));
 //    EVAL_DAILY_PER_USER   : 기기 1대가 하루에 받을 수 있는 평가 횟수 (기본 1, 테스터 기간엔 3 같은 숫자로)
 //    EVAL_DAILY_TOTAL      : 모든 사용자 합쳐서 하루 평가 횟수 상한 (기본 300)
 //    SAVE_DAILY_PER_USER   : 기기 1대가 하루에 영상을 저장(합성)할 수 있는 횟수 (기본 3)
+//    EVAL_PROVIDER_ORDER   : 인식 서비스 순서 (기본 groq,deepgram). 비교해 볼 때는 deepgram,groq 로 바꾸면 Deepgram을 먼저 써요
 //    EVAL_MAX_BYTES        : 평가에 보낼 수 있는 녹음 파일 크기 상한 (기본 2500000 = 약 2.5MB)
 // ============================================================
 const GROQ_KEY = process.env.GROQ_API_KEY || '';
@@ -131,7 +132,7 @@ async function transcribeGroq(buf, mime, lang) {
   return (j.words || []).map(w => ({ w: String(w.word || '').trim(), s: Number(w.start), e: Number(w.end) })).filter(w => w.w && Number.isFinite(w.s));
 }
 async function transcribeDeepgram(buf, mime, lang) {
-  const url = `${DG_URL}?model=nova-3&language=${encodeURIComponent(lang)}&punctuate=false&smart_format=false`;
+  const url = `${DG_URL}?model=nova-3&language=${encodeURIComponent(lang)}&punctuate=false&smart_format=false&mip_opt_out=true`;
   const r = await fetch(url, { method: 'POST', headers: { Authorization: 'Token ' + DG_KEY, 'Content-Type': mime || 'audio/webm' }, body: buf, signal: AbortSignal.timeout(45000) });
   if (!r.ok) { const e = new Error('deepgram ' + r.status); e.status = r.status; throw e; }
   const j = await r.json();
@@ -165,9 +166,10 @@ app.post('/evaluate', (req, res) => {
     if (usageGet(tk) >= EVAL_DAILY_TOTAL) return res.status(429).json({ error: 'total-limit' });
     usageAdd(uk, 1); usageAdd(tk, 1);                       // 먼저 한 번 쓴 것으로 잡아 두고, 실패하면 돌려줘요
 
-    const providers = [];
-    if (GROQ_KEY) providers.push(['groq', transcribeGroq]);
-    if (DG_KEY) providers.push(['deepgram', transcribeDeepgram]);
+    const available = { groq: GROQ_KEY ? transcribeGroq : null, deepgram: DG_KEY ? transcribeDeepgram : null };
+    const order = String(process.env.EVAL_PROVIDER_ORDER || 'groq,deepgram').split(',').map(s => s.trim().toLowerCase());
+    ['groq', 'deepgram'].forEach(n => { if (!order.includes(n)) order.push(n); });
+    const providers = order.filter(n => available[n]).map(n => [n, available[n]]);
     for (const [name, fn] of providers) {
       try {
         const words = await fn(req.file.buffer, req.file.mimetype, lang);

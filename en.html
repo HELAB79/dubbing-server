@@ -1144,6 +1144,14 @@ button,input,select,textarea{font-family:inherit;}
   /* 첫 화면 앱 이름 아래 설명 글씨 줄이기 */
   .hero-slogan{ font-size: 12px; line-height: 1.45; margin-top: 8px; }
   .hero-purpose{ font-size: 10.5px; line-height: 1.4; margin-top: 4px; }
+
+  .cmp-btn.pro{ flex:none; width:100%; margin-top:6px; background:#F1ECFF; border-color:#D8CCFA; color:#4A2FA0; }
+  .pro-panel{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-top:8px; }
+  .pro-legend{ font-size:12px; font-weight:700; display:flex; flex-wrap:wrap; gap:4px 10px; align-items:center; margin-bottom:4px; }
+  .pro-cv{ display:block; width:100%; height:84px; background:#FAF9FF; border:1px solid var(--line); border-radius:8px; margin-top:4px; }
+  .pro-cv.short{ height:56px; }
+  .pro-row{ margin-top:10px; }
+  .pro-pct{ font-size:13px; min-width:38px; text-align:right; }
 </style>
 </head>
 <body>
@@ -2184,7 +2192,8 @@ function getInstallId(){
 }
 
 let evalInfo = null;       // 서버가 알려준 오늘 남은 평가 횟수
-let evalPromise = null;    // 평가가 진행 중이면 같은 요청을 함께 기다려요
+let evalPromise = null;
+let evalProvider = '';     // 이번 평가에 쓰인 인식 서비스 이름 (테스트 중 비교용으로 화면에 작게 보여줘요)    // 평가가 진행 중이면 같은 요청을 함께 기다려요
 function renderEvalNote(){
   const el = document.getElementById('evalNote');
   if (!el) return;
@@ -2192,7 +2201,7 @@ function renderEvalNote(){
   if (!evalInfo.enabled){ el.textContent = L('📊 평가 기능은 준비 중이에요.', '📊 Evaluation is coming soon.'); return; }
   const left = evalInfo.remaining + '/' + evalInfo.limit;
   el.textContent = Object.keys(dubHeard).length
-    ? L('이 녹음은 평가를 마쳤어요 · 오늘 무료 평가 ' + left + '회 남음', 'This recording is evaluated · free evaluations left today: ' + left)
+    ? L('이 녹음은 평가를 마쳤어요' + (evalProvider ? ' (' + evalProvider + ')' : '') + ' · 오늘 무료 평가 ' + left + '회 남음', 'This recording is evaluated · free evaluations left today: ' + left)
     : L('📊 비교를 처음 누르면 이 녹음을 한 번 평가해요 · 오늘 무료 평가 ' + left + '회 남음', 'The first tap on 📊 evaluates this recording once · free evaluations left today: ' + left);
 }
 async function refreshEvalInfo(){
@@ -2250,6 +2259,7 @@ function runEvaluation(){
       try { j = await res.json(); } catch (e) {}
       if (!res.ok || !j || !j.ok) return { error: (j && j.error) || ('http-' + res.status), limit: j && j.limit };
       applyEvalWords(j.words);
+      evalProvider = j.provider || '';
       if (evalInfo){ evalInfo.remaining = j.remaining; evalInfo.limit = j.limit; }
       return { ok: true };
     } catch (e) {
@@ -2959,6 +2969,325 @@ function playMyLine(idx, onDone){
   if (p && p.catch) p.catch(() => { if (token === previewToken) clearPlayingBtn(); });
 }
 
+/* ===== 억양·리듬 분석 ===== */
+/* ========== 억양·리듬 분석 (앱 안에서 계산해요 · 서버로 보내지 않아요) ========== */
+// 소리 → 높낮이(F0)·크기(에너지)·말한 구간을 10ms 간격으로 뽑아요
+function prosodyAnalyze(x, sr){
+  const f = Math.max(1, Math.round(sr / 16000));          // 계산이 빠르도록 16kHz 근처로 줄여요
+  const sr2 = sr / f, n = Math.floor(x.length / f);
+  const y = new Float32Array(n);
+  for (let i = 0; i < n; i++){ let s = 0; for (let k = 0; k < f; k++) s += x[i * f + k]; y[i] = s / f; }
+  const hop = Math.max(1, Math.round(sr2 * 0.01)), W = Math.round(sr2 * 0.03);
+  const tauMin = Math.max(2, Math.floor(sr2 / 400)), tauMax = Math.floor(sr2 / 70);
+  const frames = Math.max(0, Math.floor((n - W - tauMax) / hop));
+  const rms = new Float32Array(frames);
+  let maxRms = 0;
+  for (let t = 0; t < frames; t++){
+    const s0 = t * hop; let e = 0;
+    for (let j = 0; j < W; j++){ const v = y[s0 + j]; e += v * v; }
+    rms[t] = Math.sqrt(e / W); if (rms[t] > maxRms) maxRms = rms[t];
+  }
+  // 말한 구간: 최대 소리의 12%보다 큰 곳
+  const thr = Math.max(0.004, maxRms * 0.12);
+  const active = new Uint8Array(frames);
+  for (let t = 0; t < frames; t++) active[t] = rms[t] > thr ? 1 : 0;
+  // 0.1초보다 짧은 끊김은 이어 붙이고, 짧은 소음은 지워요
+  const fillGap = (arr, maxGap, val) => {
+    let i = 0;
+    while (i < arr.length){
+      if (arr[i] === val){ i++; continue; }
+      let j = i; while (j < arr.length && arr[j] !== val) j++;
+      if (j - i <= maxGap && i > 0 && j < arr.length) for (let k = i; k < j; k++) arr[k] = val;
+      i = j;
+    }
+  };
+  fillGap(active, 10, 1);
+  let a = -1, b = -1;
+  { // 가장 긴 덩어리를 말한 구간으로 (앞뒤 잡음 무시)
+    let best = 0, i = 0;
+    while (i < frames){
+      if (!active[i]){ i++; continue; }
+      let j = i; while (j < frames && active[j]) j++;
+      if (j - i > best){ best = j - i; a = i; b = j - 1; }
+      i = j;
+    }
+  }
+  // 높낮이(YIN)
+  const f0 = new Float32Array(frames).fill(NaN);
+  const d = new Float32Array(tauMax + 1), cm = new Float32Array(tauMax + 1);
+  for (let t = 0; t < frames; t++){
+    if (!active[t] || rms[t] < thr) continue;
+    const s0 = t * hop;
+    d[0] = 0;
+    for (let tau = 1; tau <= tauMax; tau++){
+      let sum = 0;
+      for (let j = 0; j < W; j++){ const df = y[s0 + j] - y[s0 + j + tau]; sum += df * df; }
+      d[tau] = sum;
+    }
+    let run = 0; cm[0] = 1;
+    for (let tau = 1; tau <= tauMax; tau++){ run += d[tau]; cm[tau] = run > 0 ? d[tau] * tau / run : 1; }
+    let pick = -1;
+    for (let tau = tauMin; tau < tauMax; tau++){
+      if (cm[tau] < 0.15){ while (tau + 1 < tauMax && cm[tau + 1] < cm[tau]) tau++; pick = tau; break; }
+    }
+    if (pick < 0){
+      let m = 1, mi = -1;
+      for (let tau = tauMin; tau < tauMax; tau++) if (cm[tau] < m){ m = cm[tau]; mi = tau; }
+      if (mi > 0 && m < 0.25) pick = mi;
+    }
+    if (pick > 0){
+      let tau = pick;
+      if (pick > 1 && pick < tauMax){
+        const s1 = cm[pick - 1], s2 = cm[pick], s3 = cm[pick + 1], den = s1 + s3 - 2 * s2;
+        if (Math.abs(den) > 1e-9) tau = pick + (s1 - s3) / (2 * den);
+      }
+      f0[t] = sr2 / tau;
+    }
+  }
+  // 반음으로 바꾸기: 이 사람의 중간 높이를 0으로 (남녀·목소리 높이 차이를 없애요)
+  const voiced = [];
+  for (let t = a; t >= 0 && t <= b; t++) if (!isNaN(f0[t])) voiced.push(f0[t]);
+  const med = voiced.length ? voiced.slice().sort((p, q) => p - q)[voiced.length >> 1] : 0;
+  const st = new Float32Array(frames).fill(NaN);
+  if (med > 0) for (let t = 0; t < frames; t++) if (!isNaN(f0[t])) st[t] = 12 * Math.log2(f0[t] / med);
+  // 튀는 값 지우기 (이웃과 4반음 넘게 다르면 옥타브 오류로 봐요)
+  for (let t = 2; t < frames - 2; t++){
+    if (isNaN(st[t])) continue;
+    const nb = [st[t - 2], st[t - 1], st[t + 1], st[t + 2]].filter(v => !isNaN(v)).sort((p, q) => p - q);
+    if (nb.length >= 2){ const m = nb[nb.length >> 1]; if (Math.abs(st[t] - m) > 4) st[t] = NaN; }
+  }
+  const db = new Float32Array(frames);
+  for (let t = 0; t < frames; t++) db[t] = 20 * Math.log10(rms[t] + 1e-5);
+  // 말 사이 쉬는 구간(0.25초 이상)
+  let pauses = 0;
+  if (a >= 0){
+    let run2 = 0;
+    for (let t = a; t <= b; t++){
+      if (rms[t] <= thr){ run2++; } else { if (run2 >= 25) pauses++; run2 = 0; }
+    }
+  }
+  return { frames, a, b, st, db, durSec: a >= 0 ? (b - a + 1) * 0.01 : 0, pauses, voicedCount: voiced.length, valid: a >= 0 && b - a >= 15 };
+}
+
+function _resampleVoiced(vals, a, b, N){     // NaN(안 울린 곳)은 이웃 값으로 이어서 N개 점으로
+  const idx = [], v = [];
+  for (let t = a; t <= b; t++) if (!isNaN(vals[t])){ idx.push(t); v.push(vals[t]); }
+  if (idx.length < 6) return null;
+  const out = new Array(N);
+  let k = 0;
+  for (let p = 0; p < N; p++){
+    const t = a + (b - a) * p / (N - 1);
+    while (k + 1 < idx.length && idx[k + 1] < t) k++;
+    if (t <= idx[0]) out[p] = v[0];
+    else if (t >= idx[idx.length - 1]) out[p] = v[v.length - 1];
+    else { const t0 = idx[k], t1 = idx[k + 1], w = (t - t0) / (t1 - t0); out[p] = v[k] * (1 - w) + v[k + 1] * w; }
+  }
+  return out;
+}
+function _resampleAll(vals, a, b, N){        // 에너지: 모든 프레임 사용 + 살짝 평활
+  const out = new Array(N);
+  for (let p = 0; p < N; p++){
+    const c = a + (b - a) * p / (N - 1);
+    let s = 0, n = 0;
+    for (let t = Math.max(0, Math.round(c) - 4); t <= Math.min(vals.length - 1, Math.round(c) + 4); t++){ s += vals[t]; n++; }
+    out[p] = n ? s / n : 0;
+  }
+  return out;
+}
+function _pearson(p, q){
+  const n = p.length; let mp = 0, mq = 0;
+  for (let i = 0; i < n; i++){ mp += p[i]; mq += q[i]; }
+  mp /= n; mq /= n;
+  let sp = 0, sq = 0, spq = 0;
+  for (let i = 0; i < n; i++){ const a = p[i] - mp, b = q[i] - mq; sp += a * a; sq += b * b; spq += a * b; }
+  return sp > 1e-9 && sq > 1e-9 ? spq / Math.sqrt(sp * sq) : 0;
+}
+function _std(p){ const n = p.length; let m = 0; for (const v of p) m += v; m /= n; let s = 0; for (const v of p) s += (v - m) * (v - m); return Math.sqrt(s / n); }
+function _tailDir(c){                        // 문장 끝이 오르는지 내리는지 (끝 12% 평균 − 60~80% 평균, 반음)
+  const n = c.length, mean = (i0, i1) => { let s = 0, k = 0; for (let i = i0; i < i1; i++){ s += c[i]; k++; } return s / Math.max(1, k); };
+  const d = mean(Math.floor(n * 0.88), n) - mean(Math.floor(n * 0.6), Math.floor(n * 0.8));
+  return { delta: d, dir: d > 1.2 ? 'up' : (d < -1.2 ? 'down' : 'flat') };
+}
+
+// 원본(o)과 내 목소리(m)를 비교해요. 모든 값은 "경향"을 보여 주는 근사치예요.
+function prosodyCompare(o, m){
+  const N = 48, res = { ok: false };
+  if (!o || !m || !o.valid || !m.valid) return res;
+  res.ok = true;
+  res.paceRatio = m.durSec / o.durSec;                     // 1보다 크면 내가 더 느려요
+  res.origDur = o.durSec; res.myDur = m.durSec;
+  res.pauses = { orig: o.pauses, mine: m.pauses };
+  const oc = _resampleVoiced(o.st, o.a, o.b, N), mc = _resampleVoiced(m.st, m.a, m.b, N);
+  if (oc && mc){
+    res.pitch = {
+      r: _pearson(oc, mc),
+      rangeRatio: _std(mc) / Math.max(0.3, _std(oc)),
+      origTail: _tailDir(oc), myTail: _tailDir(mc),
+      orig: oc, mine: mc
+    };
+    res.pitch.sim = Math.round(Math.max(0, res.pitch.r) * 100);
+  }
+  const oe = _resampleAll(o.db, o.a, o.b, N), me = _resampleAll(m.db, m.a, m.b, N);
+  res.energy = { r: _pearson(oe, me), orig: oe, mine: me };
+  res.energy.sim = Math.round(Math.max(0, res.energy.r) * 100);
+  return res;
+}
+if (typeof module !== 'undefined') module.exports = { prosodyAnalyze, prosodyCompare };
+
+/* ---- 억양·리듬 화면: 원본 소리와 내 녹음을 앱 안에서 꺼내 와 비교해요 ---- */
+let _ac = null;
+function _audioCtx(){
+  if (!_ac){ const C = window.AudioContext || window.webkitAudioContext; if (!C) throw new Error('no-audio'); _ac = new C(); }
+  return _ac;
+}
+async function _decodeUrl(url){
+  const ab = await (await fetch(url)).arrayBuffer();
+  const buf = await _audioCtx().decodeAudioData(ab);
+  return { x: buf.getChannelData(0).slice(), sr: buf.sampleRate };   // 한 채널만 복사해 두고 나머지는 놓아줘요
+}
+let _origAudio = null;                      // { src, p: Promise }
+function getOrigAudio(){
+  const v = document.getElementById('dubVideo');
+  const src = v.currentSrc || v.src;
+  if (_origAudio && _origAudio.src === src) return _origAudio.p;
+  const p = _decodeUrl(src);
+  _origAudio = { src, p };
+  p.catch(() => { if (_origAudio && _origAudio.p === p) _origAudio = null; });
+  return p;
+}
+const _proCache = {};                       // 대사 번호 → { url, o, m, cmp }
+async function computeProsody(idx){
+  const url = dubRecordedUrls[idx];
+  const c = _proCache[idx];
+  if (c && c.url === url && c.src === _origAudio?.src) return c;
+  const [orig, mine] = await Promise.all([getOrigAudio(), _decodeUrl(url)]);
+  await new Promise(r => setTimeout(r, 30));      // 화면이 "분석 중"을 먼저 그리도록
+  const lt = lineTimes[idx];
+  const i0 = Math.max(0, Math.floor((lt.start - 0.1) * orig.sr)), i1 = Math.min(orig.x.length, Math.ceil((lt.end + 0.1) * orig.sr));
+  const o = prosodyAnalyze(orig.x.subarray(i0, i1), orig.sr);
+  const m = prosodyAnalyze(mine.x, mine.sr);
+  const res = { url, src: _origAudio && _origAudio.src, o, m, cmp: prosodyCompare(o, m) };
+  _proCache[idx] = res;
+  return res;
+}
+
+function _drawCurves(cv, series, zeroLine){
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 300, h = cv.clientHeight || 80;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  const g = cv.getContext('2d'); g.scale(dpr, dpr);
+  let lo = Infinity, hi = -Infinity;
+  series.forEach(s => s.vals.forEach(v => { if (v < lo) lo = v; if (v > hi) hi = v; }));
+  if (!isFinite(lo)) return;
+  if (hi - lo < 4){ const c = (hi + lo) / 2; lo = c - 2; hi = c + 2; }       // 너무 납작해 보이지 않게
+  const padY = 8, Y = v => h - padY - (v - lo) / (hi - lo) * (h - 2 * padY), X = i => 6 + i / (series[0].vals.length - 1) * (w - 12);
+  if (zeroLine && lo < 0 && hi > 0){
+    g.strokeStyle = '#D9D6E6'; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(w, Y(0)); g.stroke(); g.setLineDash([]);
+  }
+  series.forEach(s => {
+    g.strokeStyle = s.color; g.lineWidth = 2.4; g.lineJoin = 'round'; g.beginPath();
+    s.vals.forEach((v, i) => { i ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)); });
+    g.stroke();
+  });
+}
+const PRO_ORIG = '#5B3FB5', PRO_MINE = '#1FA67A';
+function _proNote(panel, text, cls){
+  const d = document.createElement('div'); d.className = cls || 'fb-note'; d.textContent = text; panel.appendChild(d); return d;
+}
+function _proRow(panel, title, pct, text){
+  const wrap = document.createElement('div'); wrap.className = 'pro-row';
+  const hd = document.createElement('div'); hd.className = 'fb-score';
+  const t = document.createElement('span'); t.textContent = title; hd.appendChild(t);
+  if (pct != null){
+    const bar = document.createElement('div'); bar.className = 'fb-bar';
+    const fill = document.createElement('i'); fill.style.width = pct + '%'; bar.appendChild(fill); hd.appendChild(bar);
+    const n = document.createElement('span'); n.className = 'pro-pct'; n.textContent = pct + '%'; hd.appendChild(n);
+  }
+  wrap.appendChild(hd);
+  _proNote(wrap, text);
+  panel.appendChild(wrap);
+}
+function _dirName(d){ return d === 'up' ? L('올라가고', 'rises') : (d === 'down' ? L('내려가고', 'falls') : L('평평하고', 'stays flat')); }
+function _dirNameEnd(d){ return d === 'up' ? L('올라가요', 'rises') : (d === 'down' ? L('내려가요', 'falls') : L('평평해요', 'stays flat')); }
+
+function renderProsody(panel, res){
+  panel.innerHTML = '';
+  const c = res.cmp;
+  if (!res.m.valid){ _proNote(panel, L('내 녹음에서 말소리를 찾지 못했어요. 마이크 가까이에서 또렷하게 다시 녹음해 보세요.', 'No speech was found in your recording. Try again closer to the mic.')); return; }
+  if (!res.o.valid){ _proNote(panel, L('원본 영상의 이 구간 소리를 분석하지 못했어요.', 'Could not analyze the original audio for this line.')); return; }
+
+  const head = document.createElement('div'); head.className = 'pro-legend';
+  head.innerHTML = '<b>🎵 ' + L('억양·리듬 비교', 'Intonation & rhythm') + '</b> <span style="color:' + PRO_ORIG + '">■ ' + L('원본', 'Original') + '</span> <span style="color:' + PRO_MINE + '">■ ' + L('내 목소리', 'You') + '</span>';
+  panel.appendChild(head);
+
+  if (c.pitch){
+    const cap = document.createElement('div'); cap.className = 'fb-note'; cap.textContent = L('억양 (목소리 높낮이의 흐름)', 'Intonation (pitch movement)'); panel.appendChild(cap);
+    const cv = document.createElement('canvas'); cv.className = 'pro-cv'; panel.appendChild(cv);
+    _drawCurves(cv, [{ vals: c.pitch.orig, color: PRO_ORIG }, { vals: c.pitch.mine, color: PRO_MINE }], true);
+  }
+  const cap2 = document.createElement('div'); cap2.className = 'fb-note'; cap2.textContent = L('강약 (소리 크기의 변화)', 'Stress (loudness changes)'); panel.appendChild(cap2);
+  const cv2 = document.createElement('canvas'); cv2.className = 'pro-cv short'; panel.appendChild(cv2);
+  _drawCurves(cv2, [{ vals: c.energy.orig, color: PRO_ORIG }, { vals: c.energy.mine, color: PRO_MINE }], false);
+
+  // 1) 속도·리듬
+  const r = c.paceRatio, pct = Math.round(Math.abs(r - 1) * 100);
+  let paceTxt = r > 1.12 ? L('원본보다 약 ' + pct + '% 느리게 말했어요.', 'You spoke about ' + pct + '% slower than the original.')
+              : (r < 0.88 ? L('원본보다 약 ' + pct + '% 빠르게 말했어요.', 'You spoke about ' + pct + '% faster than the original.')
+              : L('원본과 속도가 비슷해요.', 'Your speed is close to the original.'));
+  paceTxt += L(' (원본 ' + c.origDur.toFixed(1) + '초 · 내 목소리 ' + c.myDur.toFixed(1) + '초)', ' (original ' + c.origDur.toFixed(1) + 's · you ' + c.myDur.toFixed(1) + 's)');
+  if (c.pauses.mine > c.pauses.orig) paceTxt += L(' 중간에 끊어 읽은 곳이 원본보다 많아요 (내 ' + c.pauses.mine + '번 · 원본 ' + c.pauses.orig + '번).', ' You paused more often than the original (' + c.pauses.mine + ' vs ' + c.pauses.orig + ').');
+  _proRow(panel, L('⏱ 속도·리듬', '⏱ Speed & rhythm'), null, paceTxt);
+
+  // 2) 억양
+  if (c.pitch){
+    const p = c.pitch;
+    let t = p.sim >= 70 ? L('높낮이의 오르내림이 원본과 잘 비슷해요.', 'Your pitch movement matches the original well.')
+          : (p.sim >= 40 ? L('높낮이 흐름이 조금 달라요. 원본의 오르내림을 한 번 더 들어 보세요.', 'Your pitch movement differs a little. Listen to the original again.')
+          : L('높낮이 흐름이 원본과 많이 달라요.', 'Your pitch movement is quite different from the original.'));
+    if (p.rangeRatio < 0.6) t += L(' 원본보다 높낮이 변화가 적어서 단조롭게 들릴 수 있어요.', ' You varied your pitch less than the original, so it may sound flat.');
+    else if (p.rangeRatio > 1.6) t += L(' 원본보다 높낮이를 크게 움직였어요.', ' You moved your pitch more than the original.');
+    if (p.origTail.dir !== p.myTail.dir) t += L(' 문장 끝은 원본이 ' + _dirName(p.origTail.dir) + ' 내 목소리는 ' + _dirNameEnd(p.myTail.dir), ' At the end of the sentence the original ' + _dirNameEnd(p.origTail.dir) + ' but yours ' + _dirNameEnd(p.myTail.dir) + '.');
+    _proRow(panel, L('🎵 억양', '🎵 Intonation'), p.sim, t);
+  } else {
+    _proRow(panel, L('🎵 억양', '🎵 Intonation'), null, L('목소리 높낮이를 충분히 잡지 못했어요. 조용한 곳에서 또렷하게 말하면 더 잘 분석돼요.', 'Not enough voiced sound to track pitch. A quieter place and clearer speech help.'));
+  }
+  // 3) 강약
+  const e = c.energy;
+  _proRow(panel, L('💪 강약(강세)', '💪 Stress'), e.sim,
+    e.sim >= 70 ? L('힘을 주는 곳이 원본과 비슷해요.', 'Where you put emphasis is similar to the original.')
+    : (e.sim >= 40 ? L('강하게 읽는 부분이 조금 달라요.', 'Your emphasis differs a little.') : L('원본과 강하게 읽는 곳이 많이 달라요.', 'Your emphasis differs a lot from the original.')));
+
+  // 한 줄 조언: 가장 낮은 항목
+  const cand = [];
+  if (c.pitch) cand.push([c.pitch.sim, L('원본을 들으면서 말끝이 올라가는지 내려가는지, 어디서 높아지는지에 집중해 따라 해 보세요.', 'Listen to the original and focus on where the pitch rises and falls, especially at the end.')]);
+  cand.push([e.sim, L('원본에서 힘주어 말하는 단어를 찾아, 그 단어를 더 크고 또렷하게 말해 보세요.', 'Find the words the original stresses and say them louder and clearer.')]);
+  cand.push([Math.abs(r - 1) > 0.12 ? 100 - Math.round(Math.abs(r - 1) * 100) : 100, r > 1 ? L('조금 더 이어서, 끊지 않고 말해 보세요.', 'Try to speak a bit more smoothly without breaks.') : L('조금 더 천천히 또박또박 말해 보세요.', 'Try to speak a little slower and clearer.')]);
+  cand.sort((a, b) => a[0] - b[0]);
+  if (cand[0][0] < 70) _proNote(panel, '💡 ' + cand[0][1], 'fb-tip');
+  else _proNote(panel, L('좋아요! 속도·억양·강약이 원본과 잘 맞아요 👏', 'Great! Your speed, intonation and stress match the original well 👏'), 'fb-tip');
+
+  _proNote(panel, L('※ 소리의 높낮이·크기·길이를 원본과 견준 근사치예요. 발음이 정확한지는 판단하지 않아요. 원본에 배경 소리가 섞여 있으면 정확도가 떨어질 수 있어요.', '※ A rough comparison of pitch, loudness and timing with the original. It does not judge pronunciation accuracy. Background sound in the original can reduce accuracy.'));
+}
+
+async function showProsody(idx, row, btn){
+  let panel = row.querySelector('.pro-panel');
+  if (panel){ panel.remove(); btn.classList.remove('on'); return; }
+  panel = document.createElement('div');
+  panel.className = 'pro-panel';
+  row.appendChild(panel);
+  btn.classList.add('on');
+  _proNote(panel, L('원본과 내 목소리를 분석하는 중이에요...', 'Analyzing the original and your voice...'));
+  try {
+    const res = await computeProsody(idx);
+    if (!panel.isConnected) return;
+    renderProsody(panel, res);
+  } catch (e) {
+    if (!panel.isConnected) return;
+    panel.innerHTML = '';
+    _proNote(panel, L('이 기기에서는 소리를 분석하지 못했어요. (' + ((e && e.message) || e) + ')', 'Could not analyze the audio on this device. (' + ((e && e.message) || e) + ')'));
+  }
+}
+
+
 function mkCmpBtn(label, extraClass, disabled, onClick){
   const b = document.createElement('button');
   b.className = 'cmp-btn ' + extraClass;
@@ -3001,6 +3330,7 @@ function renderResults(){
     }));
     actions.appendChild(mkCmpBtn('📊 비교', 'cmp', !has, b => { showFeedback(idx, row, b); }));
     row.appendChild(actions);
+    row.appendChild(mkCmpBtn('🎵 ' + L('억양·리듬 보기','Intonation & rhythm'), 'pro', !has, b => { showProsody(idx, row, b); }));
     wrap.appendChild(row);
   });
   { const sb = document.getElementById('shareVideoBtn'); if (sb) sb.style.display = IS_NATIVE ? '' : 'none'; }
